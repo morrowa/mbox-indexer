@@ -13,7 +13,7 @@ pub struct MboxEntry<'a, R> {
     inner: &'a mut MagicReader<R>,
 }
 
-impl<'a, R: Read> MboxReader<R> {
+impl<'a, R: Read + Seek> MboxReader<R> {
     pub fn new(inner: R) -> Self {
         MboxReader {
             inner: MagicReader::new(inner),
@@ -24,6 +24,9 @@ impl<'a, R: Read> MboxReader<R> {
     pub fn next(&'a mut self) -> io::Result<Option<MboxEntry<'a, R>>> {
         if self.inner.eof()? {
             return Ok(None);
+        }
+        if self.inner.stream_position()? == 0 {
+            return Ok(Some(MboxEntry { inner: &mut self.inner }));
         }
         if !self.inner.eom() {
             self.inner.skip_message()?;
@@ -95,11 +98,17 @@ impl<R: Read> MagicReader<R> {
         self.next_message_start = None;
     }
 
-    /// Skips all remaining bytes in the current message. The reader will return 0 bytes until
-    /// after calling `reset_eom()`.
+    /// Skips all remaining bytes in the current message, possibly reaching EOF. After calling this,
+    /// either `self.eof()` or `self.eom()` will be true.
     fn skip_message(&mut self) -> io::Result<()> {
-        assert!(self.eom());
-        todo!()
+        loop {
+            let ready = self.fill_buf()?.len();
+            if ready == 0 {
+                break;
+            }
+            self.consume(ready);
+        }
+        Ok(())
     }
 }
 
@@ -168,8 +177,10 @@ impl<R: Read> BufRead for MagicReader<R> {
         if let Some(newline_idx) =
             memmem::find(&self.buffer[self.ready_start..self.held_back], &MAGIC_WORD)
         {
-            self.ready_end = newline_idx + 1;
-            self.next_message_start = Some(newline_idx + 1);
+            // the index returned by memmem::find is relative to the start of the slice
+            let absolute_idx = self.ready_start + newline_idx + 1;
+            self.ready_end = absolute_idx;
+            self.next_message_start = Some(absolute_idx);
         } else {
             self.ready_end = self.held_back;
         }
@@ -226,7 +237,17 @@ mod test {
     #[test]
     fn crlf() {
         // use CRLF line endings and check it works right
-        // TODO
+        let input = b"From line1\r\nFrom line2\r\n";
+        let mut reader = MagicReader::new(Cursor::new(input));
+        let mut line = String::new();
+        assert_eq!(reader.read_to_string(&mut line).unwrap(), 12);
+        assert!(reader.eom());
+        assert_eq!(line, "From line1\r\n");
+        reader.reset_eom();
+        line.clear();
+        assert_eq!(reader.read_to_string(&mut line).unwrap(), 12);
+        assert!(reader.eof().unwrap());
+        assert_eq!(line, "From line2\r\n");
     }
 
     #[test]
@@ -294,7 +315,18 @@ mod test {
     }
 
     #[test]
-    fn mbox_reader() {
-        // TODO: create an MboxReader and call next() until it stops
+    fn mbox_reader() -> io::Result<()>{
+        let raw_messages = [b"From test1\ntest1\n", b"From test2\ntest2\n", b"From test3\ntest3\n"];
+        let input: Vec<u8> = raw_messages.iter().map(|&x| x.iter().copied()).flatten().collect();
+        let mut reader = MboxReader::new(Cursor::new(input));
+        let mut messages: Vec<String> = Vec::new();
+        while let Some(mut item) = reader.next()? {
+            let mut msg = String::new();
+            assert_eq!(item.read_to_string(&mut msg)?, 17);
+            messages.push(msg);
+        }
+        let message_bytes: Vec<&[u8]> = messages.iter().map(|x| x.as_bytes()).collect();
+        assert_eq!(&raw_messages[..], message_bytes);
+        Ok(())
     }
 }
