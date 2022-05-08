@@ -6,17 +6,17 @@ use memchr::{memchr, memmem};
 use std::io::{self, BufRead, Read, Seek};
 
 pub struct MboxReader<R> {
-    inner: MagicReader<R>,
+    inner: MessageBoundaryReader<R>,
 }
 
 pub struct MboxEntry<'a, R> {
-    inner: &'a mut MagicReader<R>,
+    inner: &'a mut MessageBoundaryReader<R>,
 }
 
 impl<'a, R: Read + Seek> MboxReader<R> {
     pub fn new(inner: R) -> Self {
         MboxReader {
-            inner: MagicReader::new(inner),
+            inner: MessageBoundaryReader::new(inner),
         }
     }
 
@@ -26,7 +26,9 @@ impl<'a, R: Read + Seek> MboxReader<R> {
             return Ok(None);
         }
         if self.inner.stream_position()? == 0 {
-            return Ok(Some(MboxEntry { inner: &mut self.inner }));
+            return Ok(Some(MboxEntry {
+                inner: &mut self.inner,
+            }));
         }
         if !self.inner.eom() {
             self.inner.skip_message()?;
@@ -51,10 +53,11 @@ impl<'a, R: Read> Read for MboxEntry<'a, R> {
 const DEFAULT_CAPACITY: usize = 8192;
 const MAGIC_WORD: [u8; 6] = [0x0A, 0x46, 0x72, 0x6F, 0x6D, 0x20];
 
-/// MagicReader reads bytes until it reaches the "magic word", `From `. When it reaches the "magic
-/// word", it will stop reading (i.e. return 0 bytes). The `eom` function will return true.
-/// By calling `reset_eom`, you can read the next message.
-struct MagicReader<R> {
+/// MessageBoundaryReader reads bytes until it reaches the "magic word": `From` preceded by a
+/// newline (0x0A) and followed by a space (0x20). When it reaches the "magic word", it will stop
+/// reading (i.e. return 0 bytes) and the `eom` function will return true. To read the next message,
+/// call `reset_eom`.
+struct MessageBoundaryReader<R> {
     inner: R,
     buffer: Vec<u8>,
     buffer_end: usize,
@@ -64,9 +67,9 @@ struct MagicReader<R> {
     next_message_start: Option<usize>,
 }
 
-impl<R: Read> MagicReader<R> {
+impl<R: Read> MessageBoundaryReader<R> {
     fn new(inner: R) -> Self {
-        MagicReader {
+        MessageBoundaryReader {
             inner,
             buffer: vec![0; DEFAULT_CAPACITY],
             buffer_end: 0,
@@ -112,7 +115,7 @@ impl<R: Read> MagicReader<R> {
     }
 }
 
-impl<R: Read> Read for MagicReader<R> {
+impl<R: Read> Read for MessageBoundaryReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let available = self.fill_buf()?;
         let copied = available.len().min(buf.len());
@@ -122,7 +125,7 @@ impl<R: Read> Read for MagicReader<R> {
     }
 }
 
-impl<R: Read> BufRead for MagicReader<R> {
+impl<R: Read> BufRead for MessageBoundaryReader<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if self.ready_start != self.ready_end {
             // don't refill until all bytes have been consumed
@@ -194,7 +197,7 @@ impl<R: Read> BufRead for MagicReader<R> {
     }
 }
 
-impl<R: Seek> MagicReader<R> {
+impl<R: Seek> MessageBoundaryReader<R> {
     fn stream_position(&mut self) -> io::Result<u64> {
         // the bytes from ready_start to buffer_end have been read from the inner reader, but have
         // not been read by this reader
@@ -213,7 +216,7 @@ mod test {
     fn one_byte_reads() {
         // read one byte at a time and check it behaves properly
         let input = b"From line1\nFrom line2";
-        let mut reader = MagicReader::new(Cursor::new(input));
+        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
         let mut buf: [u8; 1] = [0];
         let mut full: Vec<u8> = Vec::with_capacity(input.len());
         for _ in 0..11 {
@@ -238,7 +241,7 @@ mod test {
     fn crlf() {
         // use CRLF line endings and check it works right
         let input = b"From line1\r\nFrom line2\r\n";
-        let mut reader = MagicReader::new(Cursor::new(input));
+        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
         let mut line = String::new();
         assert_eq!(reader.read_to_string(&mut line).unwrap(), 12);
         assert!(reader.eom());
@@ -254,7 +257,7 @@ mod test {
     fn exact_read_sizes() {
         // read the exact number of bytes in the first line, then make sure it returns 0 bytes, then the next line
         let input = b"From line1\nFrom line2";
-        let mut reader = MagicReader::new(Cursor::new(input));
+        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
         let mut buf: [u8; 11] = [0; 11];
         let bytes_read = reader.read(&mut buf).unwrap();
         assert_eq!(bytes_read, 11);
@@ -288,7 +291,7 @@ mod test {
             for block_size in 0..32 {
                 let mut buffer: Vec<u8> = vec![0; 128 + block_size];
                 let mut result: Vec<u8> = Vec::with_capacity(DEFAULT_CAPACITY + 16);
-                let mut reader = MagicReader::new(Cursor::new(&input));
+                let mut reader = MessageBoundaryReader::new(Cursor::new(&input));
                 while !reader.eom() {
                     let read = reader.read(&mut buffer).unwrap();
                     assert!(read > 0);
@@ -315,9 +318,17 @@ mod test {
     }
 
     #[test]
-    fn mbox_reader() -> io::Result<()>{
-        let raw_messages = [b"From test1\ntest1\n", b"From test2\ntest2\n", b"From test3\ntest3\n"];
-        let input: Vec<u8> = raw_messages.iter().map(|&x| x.iter().copied()).flatten().collect();
+    fn mbox_reader() -> io::Result<()> {
+        let raw_messages = [
+            b"From test1\ntest1\n",
+            b"From test2\ntest2\n",
+            b"From test3\ntest3\n",
+        ];
+        let input: Vec<u8> = raw_messages
+            .iter()
+            .map(|&x| x.iter().copied())
+            .flatten()
+            .collect();
         let mut reader = MboxReader::new(Cursor::new(input));
         let mut messages: Vec<String> = Vec::new();
         while let Some(mut item) = reader.next()? {
