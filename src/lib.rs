@@ -188,6 +188,23 @@ impl<R: Read> BufRead for MessageBoundaryReader<R> {
             self.ready_end = self.held_back;
         }
 
+        // search for `^>+From ` and erase one `>`, doing a copy within
+        if let Some(newline_off) = memmem::find(&self.buffer[self.ready_start..self.ready_end], b"\n>") {
+            let first_lt_idx = self.ready_start + newline_off + 1;
+            if let Some(from_off) = memmem::find(&self.buffer[first_lt_idx..self.ready_end], b"From ") {
+                let f_idx = first_lt_idx + from_off;
+                if self.buffer[first_lt_idx..f_idx].iter().all(|&b| b == b'>') {
+                    // this is expensive - possibly O(n) - but very rare
+                    self.buffer.remove(first_lt_idx);
+                    self.buffer.push(0);
+                    self.ready_end -= 1;
+                    self.held_back -= 1;
+                    self.buffer_end -= 1;
+                    self.next_message_start = self.next_message_start.map(|x| x - 1);
+                }
+            }
+        }
+
         Ok(&self.buffer[self.ready_start..self.ready_end])
     }
 
@@ -211,6 +228,14 @@ impl<R: Seek> MessageBoundaryReader<R> {
 mod test {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn really_deep_quotes() {
+        let mut input: Vec<u8> = vec![0; DEFAULT_CAPACITY - 5];
+        input.extend_from_slice(b"\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>From Alice");
+        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
+        assert_eq!(reader.lines().last().unwrap().unwrap(), ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>From Alice");
+    }
 
     #[test]
     fn one_byte_reads() {
