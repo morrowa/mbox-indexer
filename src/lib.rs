@@ -3,20 +3,22 @@
 // Copyright 2022 Andrew Morrow. All rights reserved.
 
 use memchr::{memchr, memmem};
-use std::io::{self, BufRead, Read, Seek};
+use std::io::{self, BufRead, Read};
 
 pub struct MboxReader<R> {
     inner: MessageBoundaryReader<R>,
+    first: bool,
 }
 
 pub struct MboxEntry<'a, R> {
     inner: &'a mut MessageBoundaryReader<R>,
 }
 
-impl<'a, R: Read + Seek> MboxReader<R> {
+impl<'a, R: Read> MboxReader<R> {
     pub fn new(inner: R) -> Self {
         MboxReader {
             inner: MessageBoundaryReader::new(inner),
+            first: true,
         }
     }
 
@@ -25,7 +27,8 @@ impl<'a, R: Read + Seek> MboxReader<R> {
         if self.inner.eof()? {
             return Ok(None);
         }
-        if self.inner.stream_position()? == 0 {
+        if self.first {
+            self.first = false;
             return Ok(Some(MboxEntry {
                 inner: &mut self.inner,
             }));
@@ -47,6 +50,16 @@ impl<'a, R: Read + Seek> MboxReader<R> {
 impl<'a, R: Read> Read for MboxEntry<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
+    }
+}
+
+impl<'a, R: Read> BufRead for MboxEntry<'a, R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt)
     }
 }
 
@@ -214,26 +227,46 @@ impl<R: Read> BufRead for MessageBoundaryReader<R> {
     }
 }
 
-impl<R: Seek> MessageBoundaryReader<R> {
-    fn stream_position(&mut self) -> io::Result<u64> {
-        // the bytes from ready_start to buffer_end have been read from the inner reader, but have
-        // not been read by this reader
-        self.inner
-            .stream_position()
-            .map(|i| i - (self.buffer_end - self.ready_start) as u64)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::io::Cursor;
+
+    #[test]
+    fn dequoting() {
+        let input_lines: Vec<&[u8]> = vec![
+            b"From first@email.com",
+            b">From some other dude",
+            b"Here's a line of text",
+            b"From second@email.com",
+            b"Another line of text",
+            b">From yet another email address",
+            b"With more lines of text",
+        ];
+        let input: Vec<u8> = input_lines.join(&b"\r\n"[..]);
+        let mut reader = MboxReader::new(input.as_slice());
+
+        let first_message: io::Result<Vec<String>> = reader.next().unwrap().unwrap().lines().collect();
+        let first_message = first_message.unwrap();
+        assert_eq!(first_message.len(), 3);
+        assert_eq!(first_message[0].as_bytes(), input_lines[0]);
+        assert_eq!(first_message[1].as_bytes(), &input_lines[1][1..]);
+        assert_eq!(first_message[2].as_bytes(), input_lines[2]);
+
+        let second_message: io::Result<Vec<String>> = reader.next().unwrap().unwrap().lines().collect();
+        let second_message = second_message.unwrap();
+        assert_eq!(second_message.len(), 4);
+        assert_eq!(second_message[0].as_bytes(), input_lines[3]);
+        assert_eq!(second_message[1].as_bytes(), input_lines[4]);
+        assert_eq!(second_message[2].as_bytes(), &input_lines[5][1..]);
+        assert_eq!(second_message[3].as_bytes(), input_lines[6]);
+        assert!(reader.next().unwrap().is_none());
+    }
 
     #[test]
     fn really_deep_quotes() {
         let mut input: Vec<u8> = vec![0; DEFAULT_CAPACITY - 5];
         input.extend_from_slice(b"\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>From Alice");
-        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
+        let reader = MessageBoundaryReader::new(input.as_slice());
         assert_eq!(reader.lines().last().unwrap().unwrap(), ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>From Alice");
     }
 
@@ -241,7 +274,7 @@ mod test {
     fn one_byte_reads() {
         // read one byte at a time and check it behaves properly
         let input = b"From line1\nFrom line2";
-        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
+        let mut reader = MessageBoundaryReader::new(input.as_slice());
         let mut buf: [u8; 1] = [0];
         let mut full: Vec<u8> = Vec::with_capacity(input.len());
         for _ in 0..11 {
@@ -266,7 +299,7 @@ mod test {
     fn crlf() {
         // use CRLF line endings and check it works right
         let input = b"From line1\r\nFrom line2\r\n";
-        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
+        let mut reader = MessageBoundaryReader::new(input.as_slice());
         let mut line = String::new();
         assert_eq!(reader.read_to_string(&mut line).unwrap(), 12);
         assert!(reader.eom());
@@ -282,7 +315,7 @@ mod test {
     fn exact_read_sizes() {
         // read the exact number of bytes in the first line, then make sure it returns 0 bytes, then the next line
         let input = b"From line1\nFrom line2";
-        let mut reader = MessageBoundaryReader::new(Cursor::new(input));
+        let mut reader = MessageBoundaryReader::new(input.as_slice());
         let mut buf: [u8; 11] = [0; 11];
         let bytes_read = reader.read(&mut buf).unwrap();
         assert_eq!(bytes_read, 11);
@@ -316,7 +349,7 @@ mod test {
             for block_size in 0..32 {
                 let mut buffer: Vec<u8> = vec![0; 128 + block_size];
                 let mut result: Vec<u8> = Vec::with_capacity(DEFAULT_CAPACITY + 16);
-                let mut reader = MessageBoundaryReader::new(Cursor::new(&input));
+                let mut reader = MessageBoundaryReader::new(input.as_slice());
                 while !reader.eom() {
                     let read = reader.read(&mut buffer).unwrap();
                     assert!(read > 0);
@@ -354,7 +387,7 @@ mod test {
             .map(|&x| x.iter().copied())
             .flatten()
             .collect();
-        let mut reader = MboxReader::new(Cursor::new(input));
+        let mut reader = MboxReader::new(input.as_slice());
         let mut messages: Vec<String> = Vec::new();
         while let Some(mut item) = reader.next()? {
             let mut msg = String::new();
